@@ -1,14 +1,22 @@
 // Selective breakout paper bot for the pump.fun replay (agent-fun/replay/v2).
+// Round 2: same proven selectivity as round 1, at the board leaders' stake
+// size, plus a real-reserve momentum gate.
 //
 // Idea: most pump.fun coins bleed to zero, and every round trip costs ~2.5%
 // in curve fees plus 0.00021 SOL of fixed tx fees, so a bot only wins by
-// being picky. This bot buys ONE small stake per coin, only when a coin
-// shows genuine accelerating buy pressure (net SOL inflow, many distinct
-// buyers, price rising and holding near its window high), and exits fast on
-// a take-profit, a stop-loss, a trailing stop, a fade, or a time limit.
-// No pyramiding, no re-entry on the same coin: one clean shot per mint.
-// A late-window breadth backstop relaxes the entry bar (and, at the very
-// end, runs tiny probe round trips) so the 20-coin guardrail is met
+// being picky. This bot buys ONE stake per coin, only when a coin shows
+// genuine accelerating buy pressure (net SOL inflow, many distinct buyers,
+// price rising and holding near its window high) AND its real quote
+// reserves have grown since first sight — real SOL committed to the curve,
+// not just virtual-reserve churn. Exits are fast and asymmetric in size,
+// not in patience: a +20% take-profit, a -6% stop, a trailing stop for
+// runners, a fade exit and a 250-slot time limit. (Round-2 testing tried
+// the fashionable alternative — early entries, no hard take-profit,
+// 900-slot holds — and it lost heavily on the dev window in both the
+// offline simulator and grade-local; the measured configuration is this
+// one.) No pyramiding, no re-entry on the same coin: one clean shot per
+// mint. A late-window breadth backstop relaxes the entry bar (and, at the
+// very end, runs tiny probe round trips) so the 20-coin guardrail is met
 // without spray-and-pray trading early.
 //
 // Fully deterministic: no clock, no Math.random, no network. All state
@@ -17,7 +25,7 @@
 import { LAMPORTS_PER_SOL, runBot, type BotState, type Batch, type BuyInput, type SellInput } from './vendor/makefun-bot.ts';
 
 const SOL = LAMPORTS_PER_SOL;
-const STAKE = (SOL * 15n) / 100n; // 0.15 SOL per position (1%-of-reserve cap binds first on small curves)
+const STAKE = (SOL * 50n) / 100n; // 0.50 SOL per position (1%-of-reserve cap binds first on small curves)
 const PROBE_STAKE = (SOL * 2n) / 100n; // 0.02 SOL late-window probe
 const MIN_BUY = (SOL * 1n) / 100n; // 0.01 SOL guardrail round-trip floor
 const BUY_SLIP_BPS = 1500;
@@ -32,7 +40,8 @@ const COOLDOWN_SLOTS = 300;
 const WINDOW_TRADES = 40;
 const MIN_AGE_SLOTS = 800; // survivor filter: fresh curves mostly dump; 800+ slots old with
 // sustained buying is where the edge lives (swept on the dev window:
-// minAge 400 loses ~-0.26 SOL, minAge 800 with strong inflow turns positive)
+// minAge 400 loses ~-0.26 SOL, minAge 800 with strong inflow turns positive;
+// round-2 sweeps re-confirmed this against 120/200/300/500)
 const MIN_RQ_SOL = 3;
 const MAX_RQ_SOL = 60;
 const MAX_ENTRIES_PER_MINT = 1;
@@ -52,6 +61,7 @@ interface Tape {
   entries: number;
   cooldownUntil: number;
   probe: boolean;
+  firstRqSol: number; // real quote reserves (SOL) at first sight, for the momentum gate
 }
 
 interface Held {
@@ -144,13 +154,16 @@ await runBot({
     for (const e of batch.events) {
       if (e.event === 'CreateEvent') {
         if (!tapes.has(e.mint)) {
-          tapes.set(e.mint, { createdSlot: e.slot, trades: [], entries: 0, cooldownUntil: 0, probe: false });
+          tapes.set(e.mint, { createdSlot: e.slot, trades: [], entries: 0, cooldownUntil: 0, probe: false, firstRqSol: 0 });
         }
       } else if (e.event === 'TradeEvent') {
         let t = tapes.get(e.mint);
         if (!t) {
-          t = { createdSlot: e.slot, trades: [], entries: 0, cooldownUntil: 0, probe: false };
+          t = { createdSlot: e.slot, trades: [], entries: 0, cooldownUntil: 0, probe: false, firstRqSol: 0 };
           tapes.set(e.mint, t);
+        }
+        if (t.trades.length === 0 && t.firstRqSol === 0) {
+          t.firstRqSol = Number(e.real_quote_reserves) / 1e9;
         }
         const p = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
         t.trades.push({
@@ -245,6 +258,10 @@ await runBot({
       if (batch.slot - t.createdSlot < MIN_AGE_SLOTS) continue;
       const rqSol = Number(curve.real_quote_reserves) / 1e9;
       if (rqSol < MIN_RQ_SOL || rqSol > MAX_RQ_SOL) continue;
+      // Real-reserve momentum: real SOL in the curve must have grown since
+      // first sight (>=1.2x, or >=+1 SOL absolute) — the curve is attracting
+      // committed capital, not just churning virtual reserves.
+      if (!(rqSol >= t.firstRqSol * 1.2 || rqSol >= t.firstRqSol + 1)) continue;
       if (t.trades.length < 10) continue;
       const s = tapeStats(t);
       if (s.net < minNet) continue;
